@@ -1,0 +1,284 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math, copy
+# Importing necessary libraries. argparse for command line arguments, socket for network connections,
+# time for time-related tasks, json for JSON parsing, select for handling multiple sockets at once,
+# struct for packing data, sys for system-specific parameters, math for mathematical operations, and copy for copying data structures.
+
+class Router:
+    relations = {}
+    sockets = {}
+    ports = {}
+    routing_table  = []
+    # Defining class variables. relations, sockets, and ports are dictionaries that will hold the relationships, sockets, and ports for each neighbor.
+    # routing_table is a list that will hold the routing information.
+
+    def __init__(self, asn, connections):
+        # The constructor for the Router class. It takes two parameters: asn (Autonomous System Number) and connections (a list of connections).
+
+        print("Router at AS %s starting up" % asn)
+        # Print a startup message.
+
+        self.asn = asn
+        # Set the ASN for this router.
+
+        for relationship in connections:
+            # For each connection in the connections list...
+
+            port, neighbor, relation = relationship.split("-")
+            # Split the relationship string into port, neighbor, and relation.
+
+            self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Create a new UDP socket for the neighbor.
+
+            self.sockets[neighbor].bind(('localhost', 0))
+            # Bind the socket to the localhost on a random free port.
+
+            self.ports[neighbor] = int(port)
+            # Store the port number for the neighbor.
+
+            self.relations[neighbor] = relation
+            # Store the relation for the neighbor.
+
+            self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}  }))
+            # Send a handshake message to the neighbor.
+
+    def our_addr(self, dst):
+        # This function takes a destination IP address and returns the source IP address for this router.
+
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        # Split the destination IP address into its four quads.
+
+        quads[3] = 1
+        # Set the last quad to 1.
+
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+        # Return the source IP address.
+
+    def send(self, network, message):
+        # This function sends a message to a network.
+
+        port = self.ports[network]
+        # Get the port for the network.
+
+        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', port))
+        # Send the message to the network.
+
+    def run(self):
+        # This function runs the router.
+
+        while True:
+            # Run forever...
+
+            readable, _, _ = select.select(self.sockets.values(), [], [], 0.1)
+            # Use select to wait for data to be available on any of the sockets.
+
+            for sock in readable:
+                # For each socket that has data...
+
+                data, _ = sock.recvfrom(65535)
+                # Receive the data.
+
+                message = json.loads(data.decode('utf-8'))
+                # Decode the data and load it as a JSON object.
+
+                self.handle_message(message)
+                # Handle the message.
+
+    def handle_message(self, message):
+        # This function handles a message.
+
+        msg_type = message.get('type')
+        # Get the type of the message.
+
+        if msg_type == 'update':
+            # If the message is an update...
+
+            self.handle_update(message)
+            # Handle the update.
+
+        elif msg_type == 'withdraw':
+            # If the message is a withdraw...
+
+            self.handle_withdraw(message)
+            # Handle the withdraw.
+
+        elif msg_type == 'handshake':
+            # If the message is a handshake...
+
+            self.handle_handshake(message)
+            # Handle the handshake.
+
+        elif msg_type == 'dump':
+            # If the message is a dump...
+
+            self.handle_dump(message)
+            # Handle the dump.
+
+        elif msg_type == 'data':
+            # If the message is data...
+
+            self.handle_data(message)
+            # Handle the data.
+
+        else:
+            # If the message type is unknown...
+
+            print(f"Unhandled message type: {msg_type}")
+            # Print an error message.
+    
+    def handle_update(self, message):
+        # This method handles an update message. It extracts the new route information from the message, appends its own ASN to the ASPath if it's not already there,
+        # determines whether to forward the route based on BGP relationship rules, and updates the routing table.
+        src_ip = message['src']
+        new_route_info = message['msg']
+        new_route = {
+            'network': new_route_info['network'],
+            'netmask': new_route_info['netmask'],
+            'next_hop': src_ip,  # The sender of the update becomes the next hop
+            'localpref': new_route_info.get('localpref', 100),
+            'ASPath': new_route_info['ASPath'],
+            'origin': new_route_info['origin'],
+            'selfOrigin': new_route_info.get('selfOrigin', False)
+        }
+
+        # Append own ASN to ASPath if forwarding the route
+        if self.asn not in new_route['ASPath']:
+            new_route['ASPath'].append(self.asn)
+
+        # Determine whether to forward the route based on BGP relationship rules
+        for neighbor_ip, relation in self.relations.items():
+            if neighbor_ip != src_ip:
+                if self.relations[src_ip] == 'cust' or relation == 'cust':
+                    self.forward_message_to_neighbor(neighbor_ip, new_route)
+
+        # Update the routing table
+        self.update_routing_table(new_route)
+
+    def is_new_route_preferred(self, new_route, existing_route):
+        # This method compares two routes and returns True if the new route is preferred over the existing route, and False otherwise.        
+        # Compare based on local preference
+        if new_route['localpref'] > existing_route['localpref']:
+            return True
+        elif new_route['localpref'] < existing_route['localpref']:
+            return False
+
+        # If local preference is equal, compare based on AS path length
+        if len(new_route['ASPath']) < len(existing_route['ASPath']):
+            return True
+        elif len(new_route['ASPath']) > len(existing_route['ASPath']):
+            return False
+
+        # If all else is equal, prefer the existing route
+        return False
+
+    def handle_withdraw(self, message):
+        # This method handles a withdraw message. It removes the route to be withdrawn from the routing table and forwards the message to all neighbors except the sender.
+        # Enhanced withdrawal handling
+        route_to_remove = message['msg']
+        self.routing_table = [route for route in self.routing_table if route != route_to_remove]
+        self.forward_message(message, exclude=[message['src']])
+
+    def handle_handshake(self, src, msg):
+        # This method handles a handshake message. It logs the handshake for debug, which helps ensure that connections between the router and its peers are established.
+        # Log handshake for debug, helps ensure that connections between the router and its peers are established
+        print("Handshake received from %s" % src)
+        # No further action needed for handshake in this basic setup
+
+    def handle_dump(self, message):
+        # This method handles a dump message. It simplifies the dump logic to correctly format the routing table and sends the routing table to the sender.
+        # Simplify the dump logic to correctly format the routing table
+        formatted_routing_table = [{
+            'network': route['network'],
+            'netmask': route['netmask'],
+            'next_hop': route['next_hop'],
+            'ASPath': route['ASPath'],
+            'origin': route['origin'],
+            'selfOrigin': route['selfOrigin']
+        } for route in self.routing_table]
+        dump_msg = {
+            "src": self.our_addr(message['src']),
+            "dst": message['src'],
+            "type": "table",
+            "msg": formatted_routing_table
+        }
+        self.send(message['src'], json.dumps(dump_msg))
+
+    def find_best_route(self, dst_ip):
+        # This method finds the best route for a given destination IP address. It iterates through the routing table and returns the best route based on the longest prefix match.
+        best_route = None
+        max_prefix_length = -1 # Initialize to an invalid value
+        for route in self.routing_table: # Iterate through the routing table
+            if self.matches(route['network'], route['netmask'], dst_ip):
+                prefix_length = self.netmask_to_prefix_length(route['netmask'])
+                if prefix_length > max_prefix_length:
+                    max_prefix_length = prefix_length
+                    best_route = route
+        return best_route   
+
+
+    def handle_data(self, message):
+        # This method handles a data message. It extracts the destination IP address from the message, finds the best route for the destination, and forwards the data packet to the next hop determined by the best route.
+        dst = message['dst']
+        best_route = self.find_best_route(dst) # Find the best route for the destination IP address
+        if best_route:
+            # Forward the data packet to the next hop determined by the best route
+            next_hop = best_route['next_hop']
+            self.send(next_hop, json.dumps(message))  # Make sure to adjust the 'send' method if necessary
+        else:
+            print(f"No route found for destination IP {dst}. Dropping the packet.") # Log an error message if no route is found
+
+
+    def matches(self, network, netmask, ip):
+        # This method checks if an IP address matches the network/netmask. It converts the network, netmask, and IP address to integers and uses bitwise AND to compare them.
+        # Check if the IP address matches the network/netmask
+        network_int = struct.unpack("!I", socket.inet_aton(network))[0] # Convert network to integer
+        netmask_int = struct.unpack("!I", socket.inet_aton(netmask))[0] 
+        ip_int = struct.unpack("!I", socket.inet_aton(ip))[0] # Convert IP address to integer
+        return (ip_int & netmask_int) == (network_int & netmask_int)
+    
+    def netmask_to_prefix_length(self, netmask):
+        # This method converts a netmask to a prefix length. It splits the netmask into its four quads, converts each quad to a binary string, and counts the number of 1s in the binary string.
+        return sum([bin(int(x)).count('1') for x in netmask.split('.')])
+
+    def forward_message_to_neighbor(self, neighbor_ip, route):
+        # This method forwards a message to a specific neighbor. It constructs a message with the update type, source and destination IP addresses, and the route information, and sends it to the neighbor.
+        # Utility method to forward a message to a specific neighbor
+        message = {
+            "type": "update",
+            "src": self.our_addr(neighbor_ip),
+            "dst": neighbor_ip,
+            "msg": route
+        }
+        self.send(neighbor_ip, json.dumps(message))
+
+    def update_routing_table(self, new_route):
+        # This method updates the routing table with a new route, replacing if necessary. It checks if the new route already exists in the routing table and replaces it if necessary.
+        # Logic to update the routing table with a new route, replacing if necessary
+        existing_route = next((route for route in self.routing_table if route['network'] == new_route['network'] and route['netmask'] == new_route['netmask']), None)
+        if existing_route:
+            self.routing_table.remove(existing_route)
+        self.routing_table.append(new_route)
+    
+    def forward_message(self, message, exclude=[]):
+        # This method forwards a message to all neighbors except those in the exclude list. It creates a copy of the message, appends the ASN to the ASPath, and sends it to all neighbors except those in the exclude list.
+        for ip, info in self.sockets.items(): # Iterate through the neighbors
+            if ip not in exclude:
+                forwarded_message = copy.deepcopy(message)
+                forwarded_message['msg']['ASPath'].append(self.asn) # Append own ASN to ASPath
+                self.send(ip, json.dumps(forwarded_message))
+
+    def update_message_for_forwarding(self, message):
+        # This method updates a message for forwarding. It creates a copy of the message, appends the ASN to the ASPath, and returns the updated message.
+        updated_message = copy.deepcopy(message)  # Use deepcopy to avoid modifying the original message
+        updated_message['msg']['ASPath'].append(self.asn)
+        return updated_message
+
+if __name__ == "__main__":
+    # The main entry point for the router program. It parses command line arguments, creates a new router object, and runs the router.
+    parser = argparse.ArgumentParser(description='route packets') # Create an argument parser
+    parser.add_argument('asn', type=int, help="AS number of this router") # Add an argument for the ASN 
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
+    args = parser.parse_args() # Parse the command line arguments
+    router = Router(args.asn, args.connections) # Create a new router object
+    router.run()
