@@ -156,23 +156,23 @@ class Router:
         self.propagate_update(message)
 
 
-    def propagate_update(self, original_message):
+    def propagate_update(self, msg):
         """
         This function propagates an update message to all neighbors except the one from which the original message was received.
 
         Parameters:
-        original_message (dict): The original update message.
+        msg (dict): The original update message.
         """
         for neighbor, info in self.sockets.items():
-            if neighbor != original_message["src"]:
+            if neighbor != msg["src"]:
                 updated_message = {
                     "type": "update",
                     "src": self.our_addr(neighbor),
                     "dst": neighbor,
                     "msg": {
-                        "network": original_message["msg"]["network"],
-                        "netmask": original_message["msg"]["netmask"],
-                        "ASPath": [self.asn] + original_message["msg"]["ASPath"],
+                        "network": msg["msg"]["network"],
+                        "netmask": msg["msg"]["netmask"],
+                        "ASPath": [self.asn] + msg["msg"]["ASPath"],
                     }
                 }
                 self.send(neighbor, json.dumps(updated_message))
