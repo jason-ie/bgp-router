@@ -64,54 +64,65 @@ class BGP_Router:
     def handle_update(self, message):
         src = message['src']
         msg = message['msg']
+        # Assume the source of the message is the next hop
+        next_hop = src if 'next_hop' not in msg else msg['next_hop']
 
-        # Check if the update source is a customer, peer, or provider
-        relation = self.connections[src]['relation']
-
-        # Update received from a customer: send updates to all other neighbors
-        # Update received from a peer or a provider: only send updates to your customers
-        if relation == 'cust':
-            self.send_update_to_peers(message, src)
-        elif relation in ('peer', 'prov'):
-            for peer_ip, peer_info in self.connections.items():
-                if peer_info['relation'] == 'cust':
-                    self.send_message(peer_ip, {
-                        'type': 'update',
-                        'src': self.asn,
-                        'dst': peer_ip,
-                        'msg': {
-                            'network': msg['network'],
-                            'netmask': msg['netmask'],
-                            'ASPath': msg['ASPath'] + [self.asn],
-                            'next_hop': msg.get('next_hop', src),
-                        }
-                    })
-
-        # Rest of your existing update handling logic...
-
-    def handle_withdraw(self, message):
-        src = message['src']
-        msg = message['msg']
-
-        for route in self.forwarding_table:
-            if route['network'] == msg['network'] and route['netmask'] == msg['netmask']:
-                self.forwarding_table.remove(route)
-                break
-
-        self.send_update_to_peers(message, src)
-
-    def handle_data(self, message):
-        dst_ip_str = message['msg'].get('dst')
-        if not dst_ip_str:
-            print("Data message missing 'dst'.")
+        # Avoid routing loops by ignoring updates containing this ASN
+        if self.asn in msg['ASPath']:
             return
 
-        dst_ip = ipaddress.ip_address(dst_ip_str)
-        best_route = self.find_best_route(dst_ip)
-        if best_route:
-            self.send_message(best_route['next_hop'], message)
-        else:
-            print(f"No route found for {dst_ip_str}")
+        updated = False
+        for route in self.forwarding_table:
+            if route['network'] == msg['network'] and route['netmask'] == msg['netmask']:
+                # Check if the new route is better
+                if len(msg['ASPath']) < len(route['ASPath']):
+                    route['ASPath'] = msg['ASPath'] + [self.asn]
+                    route['next_hop'] = next_hop
+                    updated = True
+                break
+
+        if not updated:
+            self.forwarding_table.append({
+                'network': msg['network'],
+                'netmask': msg['netmask'],
+                'ASPath': msg['ASPath'] + [self.asn],
+                'next_hop': next_hop,
+                'origin': msg.get('origin', 'IGP'),  # Default to 'IGP' if not provided
+                'localpref': msg.get('localpref', 100),  # Default to 100 if not provided
+            })
+
+        # Propagate the update to peers except the source
+        for peer_ip, peer_info in self.connections.items():
+            if peer_ip != src:
+                self.send_message(peer_ip, {
+                    'type': 'update',
+                    'src': self.asn,
+                    'dst': peer_ip,
+                    'msg': {
+                        'network': msg['network'],
+                        'netmask': msg['netmask'],
+                        'ASPath': msg['ASPath'] + [self.asn],
+                        'next_hop': next_hop,  # Preserve original next_hop
+                        'origin': msg.get('origin', 'IGP'),
+                        'localpref': msg.get('localpref', 100),
+                    }
+                })
+
+        updated_message = {**message, 'msg': {**msg, 'ASPath': msg['ASPath'] + [self.asn]}}
+        self.send_update_to_peers(updated_message, src)
+
+    def handle_data(self, message):
+            dst_ip_str = message['msg'].get('dst')
+            if not dst_ip_str:
+                print("Data message missing 'dst'.")
+                return
+
+            dst_ip = ipaddress.ip_address(dst_ip_str)
+            best_route = self.find_best_route(dst_ip)
+            if best_route:
+                self.send_message(best_route['next_hop'], message)
+            else:
+                print(f"No route found for {dst_ip_str}")
 
     def find_best_route(self, dst_ip):
         best_route = None
@@ -147,3 +158,4 @@ if __name__ == "__main__":
 
     bgp_router = BGP_Router(args.asn, args.connections)
     bgp_router.run()
+
