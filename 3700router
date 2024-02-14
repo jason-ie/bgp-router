@@ -8,14 +8,17 @@ import ipaddress
 
 class BGP_Router:
     def __init__(self, asn, connections):
+        print(f"Initializing router with ASN {asn}")
         self.asn = asn
         self.connections = {}
         self.forwarding_table = []
         self.initialize_connections(connections)
 
     def initialize_connections(self, connections):
+        print("Initializing connections...")
         for conn_str in connections:
             port, ip, relation = conn_str.split('-')
+            print(f"Initializing connection to IP {ip} with port {port} and relation {relation}")
             self.connections[ip] = {
                 'port': int(port),
                 'relation': relation,
@@ -29,6 +32,7 @@ class BGP_Router:
         return sock
 
     def send_handshake(self, ip):
+        print(f"Sending handshake to IP {ip}")
         handshake_msg = {
             "type": "handshake",
             "src": self.asn,
@@ -38,12 +42,14 @@ class BGP_Router:
         self.send_message(ip, handshake_msg)
 
     def send_message(self, ip, message):
+        print(f"Sending message to IP {ip}: {message}")
         conn_info = self.connections[ip]
         sock = conn_info['socket']
         port = conn_info['port']
         sock.sendto(json.dumps(message).encode(), ('localhost', port))
 
     def handle_message(self, message):
+        print(f"Handling message: {message}")
         if message['type'] == 'update':
             self.handle_update(message)
         elif message['type'] == 'data':
@@ -56,26 +62,31 @@ class BGP_Router:
             print(f"Unhandled message type: {message['type']}")
 
     def send_update_to_peers(self, update_message, source_ip):
-            # Implement BGP propagation rules here
-            source_relation = self.connections[source_ip]['relation']
-            for ip, info in self.connections.items():
-                if ip != source_ip:
-                    if source_relation == 'cust' or (source_relation in ['peer', 'prov'] and info['relation'] == 'cust'):
-                        self.send_message(ip, update_message)
+        print(f"Propagating update from {source_ip}: {update_message}")
+        source_relation = self.connections[source_ip]['relation']
+        for ip, info in self.connections.items():
+            if ip != source_ip:
+                if source_relation == 'cust' or (source_relation in ['peer', 'prov'] and info['relation'] == 'cust'):
+                    self.send_message(ip, update_message)
 
-    def handle_update(self, message):
-        src = message['src']
-        msg = message['msg']
-        if self.asn in msg['ASPath']:
-            return  # Avoid routing loops
-        
-        # Update ASPath to include this router's ASN
-        msg['ASPath'].append(self.asn)
-        
-        self.update_forwarding_table(src, msg)
-        self.propagate_update(msg, src)
+    def handle_data(self, message):
+        dst_ip_str = message['msg'].get('dst')
+        if not dst_ip_str:
+            print("Data message missing 'dst'.")
+            return
+
+        print(f"Handling data message for destination {dst_ip_str}")
+        dst_ip = ipaddress.ip_address(dst_ip_str)
+        best_route = self.find_best_route(dst_ip)
+        if best_route:
+            print(f"Forwarding data to {best_route['next_hop']} using route {best_route}")
+            self.send_message(best_route['next_hop'], message)
+        else:
+            print("No suitable route found for data message.")
+
 
     def update_forwarding_table(self, src, msg):
+        print(f"Updating forwarding table with message from {src}: {msg}")
         new_route = {
             'network': msg['network'],
             'netmask': msg['netmask'],
@@ -85,61 +96,117 @@ class BGP_Router:
             'localpref': msg.get('localpref', 100),
         }
         
-        # Find and replace or append new route
         for i, route in enumerate(self.forwarding_table):
             if route['network'] == new_route['network'] and route['netmask'] == new_route['netmask']:
                 if len(new_route['ASPath']) < len(route['ASPath']) or new_route['localpref'] > route['localpref']:
+                    print(f"Replacing route in forwarding table at index {i} with new route: {new_route}")
                     self.forwarding_table[i] = new_route
                     return
                 break
         else:
+            print(f"Appending new route to forwarding table: {new_route}")
             self.forwarding_table.append(new_route)
 
     def propagate_update(self, msg, src):
+        print(f"Propagating update from {src}")
         for peer_ip, info in self.connections.items():
-            # Do not send back to the source or propagate inappropriately according to BGP rules
-            if peer_ip == src or (info['relation'] != 'cust' and self.connections[src]['relation'] != 'cust'):
+            # Skip the source of the update
+            if peer_ip == src:
                 continue
-            
-            # Prepare a new message for propagation
-            propagated_msg = {
-                'type': 'update',
-                'src': self.asn,
-                'dst': peer_ip,
-                'msg': {
-                    'network': msg['network'],
-                    'netmask': msg['netmask'],
-                    'ASPath': msg['ASPath'],  # Do not append ASN here; it's already done
-                    'next_hop': msg.get('next_hop', src),  # Use original next_hop if provided
-                    'origin': msg['origin'],
-                    'localpref': msg.get('localpref', 100),
+
+            # Determine if the update should be propagated based on BGP policies
+            should_propagate = False
+            if info['relation'] == 'cust':
+                # Always propagate to customers
+                should_propagate = True
+            elif self.connections[src]['relation'] == 'cust' and info['relation'] != 'cust':
+                # Propagate updates from customers to peers/providers
+                should_propagate = True
+
+            if should_propagate:
+                # Modify the message for propagation
+                propagated_msg = {
+                    'type': 'update',
+                    'src': self.asn,
+                    'dst': peer_ip,
+                    'msg': {
+                        'network': msg['network'],
+                        'netmask': msg['netmask'],
+                        # Append this ASN only if it's not already in the AS path to prevent loops
+                        'ASPath': msg['ASPath'] + ([self.asn] if self.asn not in msg['ASPath'] else []),
+                        'next_hop': src,  # Preserve the original next_hop
+                        'origin': msg['origin'],
+                        'localpref': msg['localpref'],
+                    }
                 }
-            }
-            self.send_message(peer_ip, propagated_msg)
+                print(f"Sending update to {peer_ip}: {propagated_msg}")
+                self.send_message(peer_ip, propagated_msg)
+
+    def handle_withdraw(self, message):
+        print(f"Handling withdraw message: {message}")
+        src = message['src']
+        msg = message['msg']
+        withdrawn_route_found = False
+
+        # Iterate over the forwarding table to find the route to withdraw
+        for i, route in enumerate(self.forwarding_table):
+            if route['network'] == msg['network'] and route['netmask'] == msg['netmask']:
+                print(f"Withdrawing route: {route}")
+                del self.forwarding_table[i]  # Remove the route from the forwarding table
+                withdrawn_route_found = True
+                break  # Assuming unique network/netmask pairs, so break after finding
+
+        if not withdrawn_route_found:
+            print(f"No matching route found to withdraw for network {msg['network']} with netmask {msg['netmask']}.")
+            return
+
+        # Propagate the withdrawal to peers, if necessary
+        self.propagate_withdrawal(msg, src)
+
+    def propagate_withdrawal(self, msg, src):
+        print(f"Propagating withdrawal to peers, excluding source {src}.")
+        for peer_ip, info in self.connections.items():
+            if peer_ip != src:
+                withdraw_message = {
+                    'type': 'withdraw',
+                    'src': self.asn,
+                    'dst': peer_ip,
+                    'msg': msg
+                }
+                print(f"Sending withdrawal to {peer_ip}: {withdraw_message}")
+                self.send_message(peer_ip, withdraw_message)
 
 
     def handle_data(self, message):
-            dst_ip_str = message['msg'].get('dst')
-            if not dst_ip_str:
-                print("Data message missing 'dst'.")
-                return
+        print(f"Handling data message: {message}")
+        dst_ip_str = message['msg'].get('dst')
+        if not dst_ip_str:
+            print("Data message missing 'dst'.")
+            return
 
-            dst_ip = ipaddress.ip_address(dst_ip_str)
-            best_route = self.find_best_route(dst_ip)
-            if best_route:
-                self.send_message(best_route['next_hop'], message)
-            else:
-                print(f"No route found for {dst_ip_str}")
+        dst_ip = ipaddress.ip_address(dst_ip_str)
+        best_route = self.find_best_route(dst_ip)
+        if best_route:
+            print(f"Forwarding data message to next hop {best_route['next_hop']}")
+            self.send_message(best_route['next_hop'], message)
+        else:
+            print(f"No route found for {dst_ip_str}")
 
     def find_best_route(self, dst_ip):
+        print(f"Finding best route for destination IP {dst_ip}")
         best_route = None
         for route in self.forwarding_table:
             if dst_ip in ipaddress.ip_network(f"{route['network']}/{route['netmask']}"):
                 if not best_route or len(route['ASPath']) < len(best_route['ASPath']):
                     best_route = route
+        if best_route:
+            print(f"Best route found: {best_route}")
+        else:
+            print("No route found.")
         return best_route
 
     def handle_dump(self, message):
+        print(f"Handling dump request: {message}")
         table_msg = {
             "type": "table",
             "src": self.asn,
@@ -147,14 +214,17 @@ class BGP_Router:
             "msg": self.forwarding_table
         }
         self.send_message(message['src'], table_msg)
+        print(f"Sent table message in response to dump: {table_msg}")
 
     def run(self):
+        print("Router is running...")
         while True:
             readable_sockets = [conn['socket'] for conn in self.connections.values()]
             readable, _, _ = select.select(readable_sockets, [], [], 1)
             for sock in readable:
                 data, _ = sock.recvfrom(4096)
                 message = json.loads(data.decode())
+                print(f"Received message: {message}")
                 self.handle_message(message)
 
 if __name__ == "__main__":
@@ -163,6 +233,6 @@ if __name__ == "__main__":
     parser.add_argument("connections", nargs='+', help="Peer connections in 'port-ip-relation' format")
     args = parser.parse_args()
 
+    print(f"Starting BGP Router with ASN {args.asn} and connections {args.connections}")
     bgp_router = BGP_Router(args.asn, args.connections)
     bgp_router.run()
-
