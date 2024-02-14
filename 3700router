@@ -60,16 +60,16 @@ class BGP_Router:
     def handle_update(self, message):
         src = message['src']
         msg = message['msg']
-        next_hop = src if 'next_hop' not in msg else msg['next_hop']
+        next_hop = msg.get('next_hop', src)
 
-        if self.asn in msg['ASPath']:
+        if self.asn in msg.get('ASPath', []):
             return
 
         updated = False
         for route in self.forwarding_table:
             if route['network'] == msg['network'] and route['netmask'] == msg['netmask']:
-                if len(msg['ASPath']) < len(route['ASPath']):
-                    route['ASPath'] = msg['ASPath'] + [self.asn]
+                if len(msg.get('ASPath', [])) < len(route['ASPath']):
+                    route['ASPath'] = msg.get('ASPath', []) + [self.asn]
                     route['next_hop'] = next_hop
                     updated = True
                 break
@@ -78,9 +78,9 @@ class BGP_Router:
             self.forwarding_table.append({
                 'network': msg['network'],
                 'netmask': msg['netmask'],
-                'ASPath': msg['ASPath'] + [self.asn],
+                'ASPath': msg.get('ASPath', []) + [self.asn],
                 'next_hop': next_hop,
-                'origin': msg.get('origin', 'IGP'),
+                'origin': 'EGP' if 'selfOrigin' in msg and msg['selfOrigin'] else msg.get('origin', 'IGP'),
                 'localpref': msg.get('localpref', 100),
             })
 
@@ -92,30 +92,29 @@ class BGP_Router:
                     'dst': peer_ip,
                     'msg': {
                         'netmask': msg['netmask'],
-                        'ASPath': msg['ASPath'] + [self.asn],
+                        'ASPath': msg.get('ASPath', []) + [self.asn],
                         'network': msg['network'],
                         'next_hop': next_hop,
-                        'origin': msg.get('origin', 'IGP'),
+                        'origin': 'EGP' if 'selfOrigin' in msg and msg['selfOrigin'] else msg.get('origin', 'IGP'),
                         'localpref': msg.get('localpref', 100),
                     }
                 })
 
-        updated_message = {**message, 'msg': {**msg, 'ASPath': msg['ASPath'] + [self.asn]}}
+        updated_message = {**message, 'msg': {**msg, 'ASPath': msg.get('ASPath', []) + [self.asn]}}
         self.send_update_to_peers(updated_message, src)
 
 
     def handle_data(self, message):
-        dst_ip_str = message['msg'].get('dst')
-        if not dst_ip_str:
-            print("Data message missing 'dst'.")
-            return
-
-        dst_ip = ipaddress.ip_address(dst_ip_str)
-        best_route = self.find_best_route(dst_ip)
-        if best_route:
-            self.send_message(best_route['next_hop'], message)
-        else:
-            print(f"No route found for {dst_ip_str}")
+            dst_ip_str = message['msg'].get('dst', '')
+            if dst_ip_str:
+                dst_ip = ipaddress.ip_address(dst_ip_str)
+                best_route = self.find_best_route(dst_ip)
+                if best_route:
+                    self.send_message(best_route['next_hop'], message)
+                else:
+                    print(f"No route found for {dst_ip_str}")
+            else:
+                print("Data message missing 'dst'.")
 
     def find_best_route(self, dst_ip):
         best_route = None
@@ -130,7 +129,8 @@ class BGP_Router:
             "type": "table",
             "src": self.asn,
             "dst": message['src'],
-            "msg": self.forwarding_table
+            "msg": [{'network': route['network'], 'netmask': route['netmask'], 'ASPath': route['ASPath'],
+                     'next_hop': route['next_hop'], 'origin': route['origin'], 'localpref': route['localpref']} for route in self.forwarding_table]
         }
         self.send_message(message['src'], table_msg)
 
@@ -161,3 +161,4 @@ if __name__ == "__main__":
 
     bgp_router = BGP_Router(args.asn, args.connections)
     bgp_router.run()
+
