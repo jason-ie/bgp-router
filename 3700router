@@ -1,238 +1,263 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -u
 
-import argparse
-import json
-import socket
-import select
-import ipaddress
+import argparse, socket, json, select
+# Importing necessary libraries. argparse for command line arguments, socket for network connections,
+# time for time-related tasks, json for JSON parsing, select for handling multiple sockets at once,
+# struct for packing data, sys for system-specific parameters, math for mathematical operations, and copy for copying data structures.
 
-class BGP_Router:
+class Router:
+    relations = {}
+    sockets = {}
+    ports = {}
+    routing_table  = {}
+    # Defining class variables. relations, sockets, and ports are dictionaries that will hold the relationships, sockets, and ports for each neighbor.
+    # routing_table is a list that will hold the routing information.
+
     def __init__(self, asn, connections):
-        print(f"Initializing router with ASN {asn}")
+        """
+        The constructor for the Router class. It initializes the router with its Autonomous System Number (ASN) and its connections.
+
+        Parameters:
+        asn (int): The Autonomous System Number of the router.
+        connections (list): A list of connections for the router. Each connection is a string in the format "port-neighbor-relation".
+        """
+        print("Router at AS %s starting up" % asn)
+        # Print a startup message.
         self.asn = asn
-        self.connections = {}
-        self.forwarding_table = []
-        self.initialize_connections(connections)
+        # Set the ASN for this router.
+        self.networks = connections
+        for relationship in connections:
+            # For each connection in the connections list...
+            port, neighbor, relation = relationship.split("-")
+            # Split the relationship string into port, neighbor, and relation.
+            self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Create a new UDP socket for the neighbor.
+            self.sockets[neighbor].bind(('localhost', 0))
+            # Bind the socket to the localhost on a random free port.
+            self.ports[neighbor] = int(port)
+            # Store the port number for the neighbor.
+            self.relations[neighbor] = relation
+            # Store the relation for the neighbor.
+            self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}  }))
+            # Send a handshake message to the neighbor.
 
-    def initialize_connections(self, connections):
-        print("Initializing connections...")
-        for conn_str in connections:
-            port, ip, relation = conn_str.split('-')
-            print(f"Initializing connection to IP {ip} with port {port} and relation {relation}")
-            self.connections[ip] = {
-                'port': int(port),
-                'relation': relation,
-                'socket': self.create_socket_and_bind()
-            }
-            self.send_handshake(ip)
+    def our_addr(self, dst):
+        """
+        This function takes a destination IP address and returns the source IP address for this router.
 
-    def create_socket_and_bind(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind(('localhost', 0))
-        return sock
+        Parameters:
+        dst (str): The destination IP address.
 
-    def send_handshake(self, ip):
-        print(f"Sending handshake to IP {ip}")
-        handshake_msg = {
-            "type": "handshake",
-            "src": self.asn,
-            "dst": ip,
-            "msg": {}
-        }
-        self.send_message(ip, handshake_msg)
+        Returns:
+        str: The source IP address for this router.
+        """
+        # This function takes a destination IP address and returns the source IP address for this router.
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        # Split the destination IP address into its four quads.
+        quads[3] = 1
+        # Set the last quad to 1.
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+        # Return the source IP address.
 
-    def send_message(self, ip, message):
-        print(f"Sending message to IP {ip}: {message}")
-        conn_info = self.connections[ip]
-        sock = conn_info['socket']
-        port = conn_info['port']
-        sock.sendto(json.dumps(message).encode(), ('localhost', port))
+    def send(self, network, message):
+        """
+        This function sends a message to a network.
 
-    def handle_message(self, message):
-        print(f"Handling message: {message}")
-        if message['type'] == 'update':
-            self.handle_update(message)
-        elif message['type'] == 'data':
-            self.handle_data(message)
-        elif message['type'] == 'dump':
-            self.handle_dump(message)
-        elif message['type'] == 'withdraw':
-            self.handle_withdraw(message)
-        else:
-            print(f"Unhandled message type: {message['type']}")
-
-    def send_update_to_peers(self, update_message, source_ip):
-        print(f"Propagating update from {source_ip}: {update_message}")
-        source_relation = self.connections[source_ip]['relation']
-        for ip, info in self.connections.items():
-            if ip != source_ip:
-                if source_relation == 'cust' or (source_relation in ['peer', 'prov'] and info['relation'] == 'cust'):
-                    self.send_message(ip, update_message)
-
-    def handle_data(self, message):
-        dst_ip_str = message['msg'].get('dst')
-        if not dst_ip_str:
-            print("Data message missing 'dst'.")
-            return
-
-        print(f"Handling data message for destination {dst_ip_str}")
-        dst_ip = ipaddress.ip_address(dst_ip_str)
-        best_route = self.find_best_route(dst_ip)
-        if best_route:
-            print(f"Forwarding data to {best_route['next_hop']} using route {best_route}")
-            self.send_message(best_route['next_hop'], message)
-        else:
-            print("No suitable route found for data message.")
-
-
-    def update_forwarding_table(self, src, msg):
-        print(f"Updating forwarding table with message from {src}: {msg}")
-        new_route = {
-            'network': msg['network'],
-            'netmask': msg['netmask'],
-            'ASPath': msg['ASPath'],  # Already appended this ASN in handle_update
-            'next_hop': src,  # Use the message source as the next hop
-            'origin': msg.get('origin', 'IGP'),
-            'localpref': msg.get('localpref', 100),
-        }
-        
-        for i, route in enumerate(self.forwarding_table):
-            if route['network'] == new_route['network'] and route['netmask'] == new_route['netmask']:
-                if len(new_route['ASPath']) < len(route['ASPath']) or new_route['localpref'] > route['localpref']:
-                    print(f"Replacing route in forwarding table at index {i} with new route: {new_route}")
-                    self.forwarding_table[i] = new_route
-                    return
-                break
-        else:
-            print(f"Appending new route to forwarding table: {new_route}")
-            self.forwarding_table.append(new_route)
-
-    def propagate_update(self, msg, src):
-        print(f"Propagating update from {src}")
-        for peer_ip, info in self.connections.items():
-            # Skip the source of the update
-            if peer_ip == src:
-                continue
-
-            # Determine if the update should be propagated based on BGP policies
-            should_propagate = False
-            if info['relation'] == 'cust':
-                # Always propagate to customers
-                should_propagate = True
-            elif self.connections[src]['relation'] == 'cust' and info['relation'] != 'cust':
-                # Propagate updates from customers to peers/providers
-                should_propagate = True
-
-            if should_propagate:
-                # Modify the message for propagation
-                propagated_msg = {
-                    'type': 'update',
-                    'src': self.asn,
-                    'dst': peer_ip,
-                    'msg': {
-                        'network': msg['network'],
-                        'netmask': msg['netmask'],
-                        # Append this ASN only if it's not already in the AS path to prevent loops
-                        'ASPath': msg['ASPath'] + ([self.asn] if self.asn not in msg['ASPath'] else []),
-                        'next_hop': src,  # Preserve the original next_hop
-                        'origin': msg['origin'],
-                        'localpref': msg['localpref'],
-                    }
-                }
-                print(f"Sending update to {peer_ip}: {propagated_msg}")
-                self.send_message(peer_ip, propagated_msg)
-
-    def handle_withdraw(self, message):
-        print(f"Handling withdraw message: {message}")
-        src = message['src']
-        msg = message['msg']
-        withdrawn_route_found = False
-
-        # Iterate over the forwarding table to find the route to withdraw
-        for i, route in enumerate(self.forwarding_table):
-            if route['network'] == msg['network'] and route['netmask'] == msg['netmask']:
-                print(f"Withdrawing route: {route}")
-                del self.forwarding_table[i]  # Remove the route from the forwarding table
-                withdrawn_route_found = True
-                break  # Assuming unique network/netmask pairs, so break after finding
-
-        if not withdrawn_route_found:
-            print(f"No matching route found to withdraw for network {msg['network']} with netmask {msg['netmask']}.")
-            return
-
-        # Propagate the withdrawal to peers, if necessary
-        self.propagate_withdrawal(msg, src)
-
-    def propagate_withdrawal(self, msg, src):
-        print(f"Propagating withdrawal to peers, excluding source {src}.")
-        for peer_ip, info in self.connections.items():
-            if peer_ip != src:
-                withdraw_message = {
-                    'type': 'withdraw',
-                    'src': self.asn,
-                    'dst': peer_ip,
-                    'msg': msg
-                }
-                print(f"Sending withdrawal to {peer_ip}: {withdraw_message}")
-                self.send_message(peer_ip, withdraw_message)
-
-
-    def handle_data(self, message):
-        print(f"Handling data message: {message}")
-        dst_ip_str = message['msg'].get('dst')
-        if not dst_ip_str:
-            print("Data message missing 'dst'.")
-            return
-
-        dst_ip = ipaddress.ip_address(dst_ip_str)
-        best_route = self.find_best_route(dst_ip)
-        if best_route:
-            print(f"Forwarding data message to next hop {best_route['next_hop']}")
-            self.send_message(best_route['next_hop'], message)
-        else:
-            print(f"No route found for {dst_ip_str}")
-
-    def find_best_route(self, dst_ip):
-        print(f"Finding best route for destination IP {dst_ip}")
-        best_route = None
-        for route in self.forwarding_table:
-            if dst_ip in ipaddress.ip_network(f"{route['network']}/{route['netmask']}"):
-                if not best_route or len(route['ASPath']) < len(best_route['ASPath']):
-                    best_route = route
-        if best_route:
-            print(f"Best route found: {best_route}")
-        else:
-            print("No route found.")
-        return best_route
-
-    def handle_dump(self, message):
-        print(f"Handling dump request: {message}")
-        table_msg = {
-            "type": "table",
-            "src": self.asn,
-            "dst": message['src'],
-            "msg": self.forwarding_table
-        }
-        self.send_message(message['src'], table_msg)
-        print(f"Sent table message in response to dump: {table_msg}")
+        Parameters:
+        network (str): The network to which the message should be sent.
+        message (str): The message to send.
+        """
+        # This function sends a message to a network.
+        port = self.ports[network]
+        # Get the port for the network.
+        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', port))
+        # Send the message to the network.
 
     def run(self):
-        print("Router is running...")
         while True:
-            readable_sockets = [conn['socket'] for conn in self.connections.values()]
-            readable, _, _ = select.select(readable_sockets, [], [], 1)
-            for sock in readable:
-                data, _ = sock.recvfrom(4096)
-                message = json.loads(data.decode())
-                print(f"Received message: {message}")
-                self.handle_message(message)
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+                msg = k.decode('utf-8')
+                print("Received message '%s' from %s" % (msg, srcif))
+                self.handle_message(json.loads(msg))
+
+    def handle_message(self, message):
+        """
+        This function handles a message based on its type.
+
+        Parameters:
+        message (dict): The message to handle. The message should be a dictionary with a "type" key.
+        """
+        # This function handles a message.
+        msg_type = message["type"]
+        # Get the type of the message.
+        if msg_type == "update":
+            # If the message is an update...
+            self.handle_update(message)
+            # Handle the update.
+        elif msg_type == "handshake":
+            # If the message is a handshake...
+            self.handle_handshake(message)
+            # Handle the handshake.
+        elif msg_type == "dump":
+            # If the message is a dump...
+            self.handle_dump(message)
+            # Handle the dump.
+        elif msg_type == "data":
+            # If the message is data...
+            self.handle_data(message)
+            # Handle the data.
+        else:
+            # If the message type is unknown...
+            print(f"Unhandled message type: {msg_type}")
+            # Print an error message.
+            
+    def ip_to_bin(self, ip):
+        """
+        This function converts an IP address to binary.
+
+        Parameters:
+        ip (str): The IP address to convert.
+
+        Returns:
+        str: The binary representation of the IP address.
+        """
+        return ''.join([bin(int(x) + 256)[3:] for x in ip.split('.')])
+
+    def handle_update(self, message):
+        """
+        This function handles an update message.
+
+        Parameters:
+        message (dict): The update message to handle.
+        """
+        network = message["msg"]["network"]
+        netmask = message["msg"]["netmask"]
+        localpref = message["msg"]["localpref"]
+        as_path = message["msg"]["ASPath"]
+        origin = message["msg"]["origin"]
+        selfOrigin = message["msg"].get("selfOrigin", False)
+        route_key = f"{network}/{netmask}"
+        self.routing_table[route_key] = {
+            "src": message["src"],
+            "dst": message["dst"],
+            "localpref": localpref,
+            "ASPath": as_path,
+            "origin": origin,
+            "selfOrigin": selfOrigin,
+            "received_from": message["src"]
+        }
+        self.propagate_update(message)
+
+
+    def propagate_update(self, original_message):
+        """
+        This function propagates an update message to all neighbors except the one from which the original message was received.
+
+        Parameters:
+        original_message (dict): The original update message.
+        """
+        for neighbor, info in self.sockets.items():
+            if neighbor != original_message["src"]:
+                updated_message = {
+                    "type": "update",
+                    "src": self.our_addr(neighbor),
+                    "dst": neighbor,
+                    "msg": {
+                        "network": original_message["msg"]["network"],
+                        "netmask": original_message["msg"]["netmask"],
+                        "ASPath": [self.asn] + original_message["msg"]["ASPath"],
+                    }
+                }
+                self.send(neighbor, json.dumps(updated_message))
+
+    def handle_handshake(self, src, msg):
+        print("Handshake received from %s" % src)
+
+    def handle_dump(self, message):
+        """
+        This function handles a dump message.
+
+        Parameters:
+        message (dict): The dump message to handle.
+        """
+        table_message = {
+            "src": message["dst"],
+            "dst": message["src"],
+            "type": "table",
+            "msg": []
+        }
+        for route_key, route_info in self.routing_table.items():
+            table_message["msg"].append({
+                "network": route_key.split('/')[0],
+                "netmask": route_key.split('/')[1],
+                "peer": route_info["received_from"],
+                "localpref": route_info["localpref"],
+                "ASPath": route_info["ASPath"],
+                "selfOrigin": route_info["selfOrigin"],
+                "origin": route_info["origin"]
+            })
+        self.send(message["src"], json.dumps(table_message))
+
+    def find_best_route(self, dst_ip):
+        """
+        This function finds the best route for a given destination IP address.
+
+        Parameters:
+        dst_ip (str): The destination IP address.
+
+        Returns:
+        dict: The best route for the destination IP address.
+        """
+        dst_ip_bin = int(self.ip_to_bin(dst_ip), 2)
+
+        for route_key, route_desc in self.routing_table.items():
+            network, netmask = route_key.split('/')
+            network_bin = int(self.ip_to_bin(network), 2)
+            netmask_bin = int(self.ip_to_bin(netmask), 2)
+            if dst_ip_bin & netmask_bin == network_bin & netmask_bin:
+                return route_desc
+
+    def handle_data(self, message):
+        """
+        This function handles a data message.
+
+        Parameters:
+        message (dict): The data message to handle.
+        """
+        dst_ip = message["dst"]
+        best_route = self.find_best_route(dst_ip)
+        if best_route:
+            self.forward_data(best_route["received_from"], message)
+
+
+    def forward_data(self, next_hop, message):
+        """
+        This function forwards a data packet to the next hop towards its destination.
+
+        Parameters:
+        next_hop (str): The next hop for the data packet.
+        message (dict): The data packet to forward.
+        """
+        if next_hop in self.sockets:
+            self.send(next_hop, json.dumps(message))
+            print(f"Forwarded data packet to {next_hop} for destination {message['dst']}")
+        else:
+            print(f"Next hop {next_hop} not found in sockets. Cannot forward packet.")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Simplified BGP Router")
-    parser.add_argument("asn", type=int, help="Autonomous System Number")
-    parser.add_argument("connections", nargs='+', help="Peer connections in 'port-ip-relation' format")
+    """Runs the router, given in the starter code"""
+    parser = argparse.ArgumentParser(description='Route packets between networks')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', nargs='+', help="Connections in the format port-neighbor-relation")
     args = parser.parse_args()
 
-    print(f"Starting BGP Router with ASN {args.asn} and connections {args.connections}")
-    bgp_router = BGP_Router(args.asn, args.connections)
-    bgp_router.run()
+    router = Router(args.asn, args.connections)
+    router.run()
