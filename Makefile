@@ -1,2 +1,2 @@
-3700router;
-	@;
+run:
+	python3 3700router
