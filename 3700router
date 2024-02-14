@@ -66,65 +66,56 @@ class BGP_Router:
     def handle_update(self, message):
         src = message['src']
         msg = message['msg']
-        # Avoid routing loops by ignoring updates containing this ASN
         if self.asn in msg['ASPath']:
-            return
+            return  # Avoid routing loops
         
-        # Update the forwarding table
+        # Update ASPath to include this router's ASN
+        msg['ASPath'].append(self.asn)
+        
         self.update_forwarding_table(src, msg)
-        
-        # Propagate the update according to BGP rules
         self.propagate_update(msg, src)
 
     def update_forwarding_table(self, src, msg):
-        """
-        Update the forwarding table based on a received update message.
-        """
-        # Extract necessary info from the message
-        network = msg['network']
-        netmask = msg['netmask']
-        ASPath = msg['ASPath']
-        origin = msg.get('origin', 'IGP')
-        localpref = msg.get('localpref', 100)
-        
-        # Prepare the new route entry
         new_route = {
-            'network': network,
-            'netmask': netmask,
-            'ASPath': ASPath + [self.asn],  # Append this ASN to the AS path
-            'next_hop': src,
-            'origin': origin,
-            'localpref': localpref,
+            'network': msg['network'],
+            'netmask': msg['netmask'],
+            'ASPath': msg['ASPath'],  # Already appended this ASN in handle_update
+            'next_hop': src,  # Use the message source as the next hop
+            'origin': msg.get('origin', 'IGP'),
+            'localpref': msg.get('localpref', 100),
         }
         
-        # Determine if the new route is better than existing ones
+        # Find and replace or append new route
         for i, route in enumerate(self.forwarding_table):
-            if route['network'] == network and route['netmask'] == netmask:
-                # Replace if the new route has a shorter AS path or higher local preference
+            if route['network'] == new_route['network'] and route['netmask'] == new_route['netmask']:
                 if len(new_route['ASPath']) < len(route['ASPath']) or new_route['localpref'] > route['localpref']:
                     self.forwarding_table[i] = new_route
                     return
                 break
         else:
-            # If no existing route matches, add the new route
             self.forwarding_table.append(new_route)
 
     def propagate_update(self, msg, src):
-        """
-        Propagate the update to peers according to BGP rules.
-        """
         for peer_ip, info in self.connections.items():
-            if peer_ip == src:
-                continue  # Do not send back to the source
-            if info['relation'] == 'cust' or (info['relation'] == 'peer' and self.connections[src]['relation'] == 'cust'):
-                # Propagate updates received from customers to all peers
-                # and updates received from peers only to customers
-                self.send_message(peer_ip, {
-                    'type': 'update',
-                    'src': self.asn,
-                    'dst': peer_ip,
-                    'msg': msg  # Send the original message without appending ASN to ASPath here
-                })
+            # Do not send back to the source or propagate inappropriately according to BGP rules
+            if peer_ip == src or (info['relation'] != 'cust' and self.connections[src]['relation'] != 'cust'):
+                continue
+            
+            # Prepare a new message for propagation
+            propagated_msg = {
+                'type': 'update',
+                'src': self.asn,
+                'dst': peer_ip,
+                'msg': {
+                    'network': msg['network'],
+                    'netmask': msg['netmask'],
+                    'ASPath': msg['ASPath'],  # Do not append ASN here; it's already done
+                    'next_hop': msg.get('next_hop', src),  # Use original next_hop if provided
+                    'origin': msg['origin'],
+                    'localpref': msg.get('localpref', 100),
+                }
+            }
+            self.send_message(peer_ip, propagated_msg)
 
 
     def handle_data(self, message):
