@@ -60,32 +60,49 @@ class BGP_Router:
     def handle_update(self, message):
         src = message['src']
         msg = message['msg']
-        # If this ASN is already in the AS path, ignore the update to prevent loops
+        next_hop = src if 'next_hop' not in msg else msg['next_hop']
+
         if self.asn in msg['ASPath']:
             return
 
-        # Determine if we need to update our forwarding table
-        update_needed = False
+        updated = False
         for route in self.forwarding_table:
             if route['network'] == msg['network'] and route['netmask'] == msg['netmask']:
-                # Prefer shorter AS paths or paths with higher local preference
-                if len(msg['ASPath']) + 1 < len(route['ASPath']) or msg.get('localpref', 100) > route.get('localpref', 100):
-                    update_needed = True
-                    break
+                if len(msg['ASPath']) < len(route['ASPath']):
+                    route['ASPath'] = msg['ASPath'] + [self.asn]
+                    route['next_hop'] = next_hop
+                    updated = True
+                break
 
-        # If the route is new or better than what we have, update the forwarding table
-        if update_needed or not any(route['network'] == msg['network'] and route['netmask'] == msg['netmask'] for route in self.forwarding_table):
-            new_route = {
+        if not updated:
+            self.forwarding_table.append({
                 'network': msg['network'],
                 'netmask': msg['netmask'],
                 'ASPath': msg['ASPath'] + [self.asn],
-                'next_hop': src,  # Use the message source as the next hop
+                'next_hop': next_hop,
                 'origin': msg.get('origin', 'IGP'),
                 'localpref': msg.get('localpref', 100),
-            }
-            self.forwarding_table.append(new_route)
-            # Propagate this update to peers, except the source
-            self.send_update_to_peers(message, src)
+            })
+
+        for peer_ip, peer_info in self.connections.items():
+            if peer_ip != src:
+                self.send_message(peer_ip, {
+                    'type': 'update',
+                    'src': self.asn,
+                    'dst': peer_ip,
+                    'msg': {
+                        'netmask': msg['netmask'],
+                        'ASPath': msg['ASPath'] + [self.asn],
+                        'network': msg['network'],
+                        'next_hop': next_hop,
+                        'origin': msg.get('origin', 'IGP'),
+                        'localpref': msg.get('localpref', 100),
+                    }
+                })
+
+        updated_message = {**message, 'msg': {**msg, 'ASPath': msg['ASPath'] + [self.asn]}}
+        self.send_update_to_peers(updated_message, src)
+
 
     def handle_data(self, message):
         dst_ip_str = message['msg'].get('dst')
