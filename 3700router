@@ -1,18 +1,17 @@
 #!/usr/bin/env -S python3 -u
 
-import argparse, socket, json, select
-# Importing necessary libraries. argparse for command line arguments, socket for network connections,
-# time for time-related tasks, json for JSON parsing, select for handling multiple sockets at once,
-# struct for packing data, sys for system-specific parameters, math for mathematical operations, and copy for copying data structures.
+import argparse, socket, json, select, copy
+from textwrap import wrap
 
 class Router:
-    relations = {}
-    sockets = {}
-    ports = {}
-    routing_table  = {}
-    # Defining class variables. relations, sockets, and ports are dictionaries that will hold the relationships, sockets, and ports for each neighbor.
-    # routing_table is a list that will hold the routing information.
 
+    relations = {} # neighbor : relation (cust, peer, prov)
+    sockets = {} # neighbor : socket
+    ports = {} # neighbor : port
+    announcements = [] # list of announcements
+    routing_table = [] # list of routing table entries
+    ip_addresses = [] # list of IP addresses
+    
     def __init__(self, asn, connections):
         """
         The constructor for the Router class. It initializes the router with its Autonomous System Number (ASN) and its connections.
@@ -41,6 +40,7 @@ class Router:
             self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}  }))
             # Send a handshake message to the neighbor.
 
+
     def our_addr(self, dst):
         """
         This function takes a destination IP address and returns the source IP address for this router.
@@ -59,21 +59,458 @@ class Router:
         return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
         # Return the source IP address.
 
-    def send(self, network, message):
+    def send(self, network, message, custOnly = False):
         """
-        This function sends a message to a network.
-
+        This function takes a network and a message and sends the message to the network.
+        
         Parameters:
-        network (str): The network to which the message should be sent.
+        network (str): The network to send the message to.
         message (str): The message to send.
+        custOnly (bool): A boolean that is True if the message should only be sent to customers and False otherwise.
+        
+        Returns:
+        None
         """
-        # This function sends a message to a network.
-        port = self.ports[network]
-        # Get the port for the network.
-        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', port))
-        # Send the message to the network.
+        for k in self.relations:
+            if k == network:
+                if(not custOnly or self.relations.get(k) == "cust"):
+                    self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
+                return
+        network = self.findNetwork(network)
+        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
+
+    def handleMessage(self, msg):
+        """
+        This function takes a message and handles it.
+        
+        Parameters:
+        msg (str): The message to handle.
+        
+        Returns:
+        None
+        """
+        obj = json.loads(msg) # Parse the message as a JSON object.
+        msg_type = obj['type']
+        self.announcements.append(msg)
+        if(msg_type == "update"):
+            self.handleUpdate(obj)
+        elif(msg_type == "dump"):
+            self.handleDump(obj)
+        elif(msg_type == "data"):
+            self.handleData(obj)
+        elif(msg_type == "withdraw"):
+            self.handleWithdraw(obj)
+        return
+
+    def handleUpdate(self, msg):
+        """
+        This function handles an update message from a neighbor.
+        
+        Parameters:
+        msg (dict): The update message.
+        
+        Returns:
+        None
+        """ 
+        message = msg['msg'] # Get the message from the update.
+        message['src'] = msg['src'] # Set the source of the message to the source of the update.
+        self.routing_table.append(copy.deepcopy(message)) # Add the message to the routing table.
+        for source in range(len(self.routing_table)): # For each entry in the routing table...
+            if "src" in self.routing_table[source]:
+                self.routing_table[source]["peer"] = self.routing_table[source].pop("src")
+        update = {} # Create a new object to store the message.
+        update["type"] = "update" # Set the type of the message to "update".
+        update["msg"] = { # Set the message of the message to a new object with the following fields...
+                    "network": msg['msg']['network'],
+                    "netmask": msg['msg']['netmask'],
+                    "ASPath": msg['msg']['ASPath']}
+        update['msg']['ASPath'].insert(0, self.asn)
+
+        self.aggregate_table() # Aggregate the routing table.
+
+        """
+        For each neighbor in the relations...
+        
+        If the relation of the neighbor is not "cust"...
+        
+        Set the source of the message to the address of the neighbor.
+        
+        Set the destination of the message to the address of the neighbor.
+        
+        If the destination of the message is not the source of the update...
+        
+        Send the message to the destination of the message.
+        """
+        if(not(self.relations[msg['src']] == "cust")):
+            for neighbor in self.relations:
+                update['src']= self.our_addr(neighbor)
+                update['dst'] = neighbor                
+                if update['dst'] != msg['src'] and self.relations[update['dst']] == "cust":
+                    self.send(update['dst'], json.dumps(update))
+        else:
+            for neighbor in self.relations:
+                update['src']= self.our_addr(neighbor)
+                update['dst'] = neighbor
+                if update['dst'] != msg['src']:
+                    self.send(update['dst'], json.dumps(update))
+            return
+        
+
+    def handleData(self, msg):
+        """ 
+        This function handles a data message from a neighbor.
+        
+        Parameters:
+        msg (dict): The data message.
+        
+        Returns:
+        None
+        """
+        message = {} # Create a new object to store the message.
+        message['src'] = self.our_addr(msg['src'])
+        message['dst'] = msg['dst']
+        neighbor = self.findNetwork(msg['dst'])
+        if(neighbor is None):
+            message['dst'] = msg['src']
+            message['type'] = "no route"
+            message['msg'] = {}
+            self.send(message['dst'], json.dumps(message))
+        else:
+            message['type'] = "data"
+            message['msg'] = msg['msg']
+            if(self.relations[self.findNetwork(msg['src'])] != 'cust'):
+                self.send(neighbor, json.dumps(message), True)
+                return
+            self.send(neighbor, json.dumps(message))
+
+
+    def findOptimalNetwork(self, poss_returns):
+        """
+        This function takes a list of possible returns and returns the optimal network.
+        
+        Parameters:
+        poss_returns (list): A list of possible returns.
+        
+        Returns:
+        dict: The optimal network.
+        """
+        opt_network = poss_returns[0]
+        for i in range(len(poss_returns)):
+            contender = poss_returns[i]
+            if(contender[1] > opt_network[1]): # If the netmask of the contender is greater than the netmask of the optimal network...
+                opt_network = contender
+            elif(contender[1] < opt_network[1]): # If the netmask of the contender is less than the netmask of the optimal network...
+                continue
+            elif(contender[0]['localpref'] > opt_network[0]['localpref']): # If the local preference of the contender is greater than the local preference of the optimal network...
+                opt_network = contender
+            elif(contender[0]['localpref'] < opt_network[0]['localpref']): # If the local preference of the contender is less than the local preference of the optimal network...
+                continue
+            elif(contender[0]['selfOrigin'] and not opt_network[0]['selfOrigin']): # If the contender is the optimal network...
+                opt_network = contender
+            elif(not contender[0]['selfOrigin'] and opt_network[0]['selfOrigin']): # If the optimal network is the contender...
+                continue
+            elif(len(contender[0]['ASPath']) < len(opt_network[0]['ASPath'])): # If the AS path of the contender is less than the AS path of the optimal network...
+                opt_network = contender
+            elif(len(contender[0]['ASPath']) > len(opt_network[0]['ASPath'])): # If the AS path of the contender is greater than the AS path of the optimal network...
+                continue
+            elif(self.hasOptimalSrc(contender[0]['origin'], opt_network[0]['origin'])): # If the contender has the optimal source...
+                opt_network = contender
+            elif(contender[0]['origin'] != opt_network[0]['origin']): # If the contender does not have the optimal source...
+                continue
+            elif(self.hasLowerIP(contender[0]['peer'], opt_network[0]['peer'])): # If the peer of the contender is less than the peer of the optimal network...
+                opt_network = contender
+        return opt_network[0]
+        
+    def findNetwork(self, ip):
+        """
+        This function takes an IP address and returns the network that the IP address is in.
+        
+        Parameters:
+        ip (str): The IP address.
+        
+        Returns:
+        str: The network that the IP address is in.
+        """
+        poss_returns = [] # Create a new list to store possible returns.
+        quads = ip.split(".") # Split the IP address into its four quads.
+        for i in range(len(quads)): # For each quad in the IP address...
+            quads[i] = bin(int(quads[i])).replace("0b","") # Convert the quad to binary.
+            quads[i] = quads[i].zfill(8) # Pad the binary quad with zeros to make it 8 bits long.
+        ip = ''.join(quads) # Join the quads together to form the IP address. 
+        
+        for entry in self.routing_table: # For each entry in the routing table...
+            network = entry['network'].split(".") # Split the network of the entry into its four quads.
+            netmask_arr = entry['netmask'].split(".")
+            for i in range(len(network)):
+                network[i] = bin(int(network[i])).replace("0b","")
+                network[i] = network[i].zfill(8)
+            for i in range(len(netmask_arr)):
+                netmask_arr[i] = bin(int(netmask_arr[i])).replace("0b","")
+                netmask_arr[i] = netmask_arr[i].zfill(8)
+            ip2 = ''.join(network)
+            netmask2 = ''.join(netmask_arr)
+            if ip == ip2:
+                return entry
+            for i in range(len(netmask2)):
+                if netmask2[i] == '0' and ip[i-1] == ip2[i-1]:
+                    poss_returns.append((entry, i))
+                    break
+                elif ip[i] != ip2[i]:
+                    break
+        if(len(poss_returns) == 0):
+            return None
+        elif len(poss_returns) == 1:
+            return poss_returns[0][0]['peer']
+        return self.findOptimalNetwork(poss_returns)['peer']
+    
+    def hasOptimalSrc(self, one, two):
+        """
+        This function takes two strings and returns True if the first string is the optimal source and False otherwise.
+        
+        Parameters:
+        one (str): The first string.
+        two (str): The second string.
+        
+        Returns:
+        bool: True if the first string is the optimal source and False otherwise.
+        """
+        if one == 'IGP' and two != 'IGP':
+            return True
+        if one == 'EGP' and two == 'UNK':
+            return True
+        return False
+
+    def hasLowerIP(self, one, two):
+        """
+        This function takes two strings and returns True if the first string is less than the second string and False otherwise.
+        
+        Parameters:
+        one (str): The first string.
+        two (str): The second string.
+        
+        Returns:
+        bool: True if the first string is less than the second string and False otherwise.
+        """
+        num1 = int(one.replace(".","")) # Remove the periods from the first string and convert it to an integer.
+        num2 = int(two.replace(".","")) # Remove the periods from the second string and convert it to an integer.
+        return num1 < num2
+    
+    def update_netmask(self, nmask):
+        """
+        This function takes a netmask and returns the netmask with an extra one.
+        
+        Parameters:
+        nmask (str): The netmask.
+        
+        Returns:
+        str: The netmask with an extra one.
+        """
+        quads = nmask.split(".") # Split the netmask into its four quads.
+        for i in range(len(quads)):
+            quads[i] = bin(int(quads[i])).replace("0b","") # Convert the quad to binary.
+            quads[i] = quads[i].zfill(8)
+        netmask = ''.join(quads)
+        index = netmask.find("0")
+        netmask = netmask[:index] + "1" + netmask[index + 1:] # Set the first zero in the netmask to one.
+
+        netmask_quads = wrap(netmask, 8) # Wrap the netmask into quads of 8 bits.
+        for i in range(len(netmask_quads)):
+            netmask_quads[i] = str(int(netmask_quads[i], 2))
+        
+        return '.'.join(netmask_quads)
+    
+    def disaggregate_nmasks(self, arr):
+        """
+        This function disaggregates the netmasks of two IP addresses.
+        
+        Parameters:
+        arr (list): A list of IP addresses.
+        
+        Returns:
+        None
+        """
+        adds = [] # Create a new list to store items to add.
+        removes = [] # Create a new list to store items to remove.
+        for obj in arr: # For each object in the array...
+            for i in range(len(self.ip_addresses)): # For each IP address in the IP addresses...
+                idx = -1 
+                if self.ip_addresses[i]["new_ip"] in self.routing_table: # If the new IP address is in the routing table...
+                    idx = self.routing_table.index(self.ip_addresses[i]["new_ip"])
+                if(obj["network"] == self.ip_addresses[i]["ip1"]["network"] and obj["netmask"] == self.ip_addresses[i]["ip1"]["netmask"]):
+                    removes.append(idx)
+                    adds.append(self.ip_addresses[i]["ip2"])
+                if(obj["network"] == self.ip_addresses[i]["ip2"]["network"] and obj["netmask"] == self.ip_addresses[i]["ip2"]["netmask"]): # If the network of the object is the same as the network of the IP address and the netmask of the object is the same as the netmask of the IP address...
+                    removes.append(idx)
+                    adds.append(self.ip_addresses[i]["ip1"]) 
+            for i in range(len(self.routing_table)):
+                if(self.parent_contains_child(obj, self.routing_table[i])):
+                    self.routing_table[i]["netmask"] = self.update_netmask(self.routing_table[i]["netmask"])
+        i = len(self.routing_table) - 1 
+        while i >= 0:
+            if(i in removes):
+                self.routing_table.pop(i)
+            i -= 1
+        self.routing_table.extend(adds)
+
+    def handleWithdraw(self, msg): 
+        """
+        This function handles a withdraw message from a neighbor.
+        
+        Parameters:
+        msg (dict): The withdraw message.
+        
+        Returns:
+        None
+        """
+        removes = [] # Create a new list to store items to remove.
+        for i in range(len(self.routing_table)):
+            message = {} # Create a new object to store the message.
+            message["network"] = self.routing_table[i]["network"]
+            message["netmask"] = self.routing_table[i]["netmask"]
+            if message in msg["msg"] and msg["src"] == self.routing_table[i]["peer"]:
+                removes.append(i)
+                
+        i = len(self.routing_table) - 1
+        while i >= 0:
+            if(i in removes):
+                self.routing_table.pop(i)
+            i -= 1
+        if(len(self.ip_addresses) > 0):
+            self.disaggregate_nmasks(msg["msg"])
+
+        newMessage = copy.deepcopy(msg) # Create a new object to store the message.
+        newMessage['src'] = self.our_addr(msg['src'])
+        if(self.relations[msg['src']] == "cust"):
+            for neighbor in self.relations:
+                newMessage['dst'] = neighbor
+                if newMessage['dst'] != msg['src']:
+                    newMessage['src'] = self.our_addr(neighbor)
+                    self.send(newMessage['dst'], json.dumps(newMessage))
+            return
+        else:
+            for neighbor in self.relations:
+                newMessage['dst'] = neighbor
+                if newMessage['dst'] != msg['src'] and self.relations[newMessage['dst']] == "cust":
+                    newMessage['src'] = self.our_addr(neighbor)
+                    self.send(newMessage['dst'], json.dumps(newMessage))
+
+    def aggregate_nmasks(self, one):
+        """
+        This function aggregates the netmasks of two IP addresses.
+        
+        Parameters:
+        one (str): The netmask of the first IP address.
+        
+        Returns:
+        str: The aggregated netmask.
+        """
+        quads = one.split(".") # Split the netmask of the first IP address into its four quads.
+        for i in range(len(quads)):
+            quads[i] = bin(int(quads[i])).replace("0b","")
+            quads[i] = quads[i].zfill(8)
+        netmask = ''.join(quads) # Join the quads together to form the netmask of the first IP address.
+        for i in range(len(netmask)):
+            if netmask[i] == '0' and netmask[i-1] == '1': # If the netmask has a zero and the previous quad has a one...
+                netmask = netmask[:i-1] + '0' + netmask[i:]
+        netmask_quads = wrap(netmask, 8) # Wrap the netmask into quads of 8 bits.
+        for i in range(len(netmask_quads)):
+            netmask_quads[i] = str(int(netmask_quads[i], 2))
+        
+        return '.'.join(netmask_quads)
+    
+    def aggregate_table(self):
+        """
+        This function aggregates the routing table.
+        
+        Returns:
+        None
+        """
+        removes = [] # Create a new list to store items to remove.
+        adds = [] # Create a new list to store items to add.
+        for i in range(len(self.routing_table)):
+            one = self.routing_table[i]
+            for j in range(i, len(self.routing_table)):
+                two = self.routing_table[j]
+                if i == j:
+                    continue
+                if (one["netmask"] == two["netmask"] and one["localpref"] == two["localpref"] and one["ASPath"] == two["ASPath"] and one["origin"] == two["origin"] and one["selfOrigin"] == two["selfOrigin"] and one["peer"] == two["peer"]):
+                    removes.append(one)
+                    removes.append(two)
+                    ip1 = copy.deepcopy(one)
+                    ip2 = copy.deepcopy(two)
+                    new_ip = copy.deepcopy(one)
+                    new_ip["netmask"] = self.aggregate_nmasks(one["netmask"])
+                    self.ip_addresses.append({"ip1": ip1, "ip2": ip2, "new_ip": new_ip})
+                    adds.append(new_ip)
+        i = len(self.routing_table) - 1
+        while i >= 0:
+            if(self.routing_table[i] in removes):
+                self.routing_table.pop(i)
+            i -= 1
+        self.routing_table.extend(adds)
+
+    def parent_contains_child(self, child, parent):
+        """
+        This function takes a child and a parent and returns True if the child is contained in the parent and False otherwise.
+        
+        Parameters:
+        child (dict): The child.
+        parent (dict): The parent.
+        
+        Returns:
+        bool: True if the child is contained in the parent and False otherwise.
+        """
+        network_child_quads = child['network'].split(".") # Split the network of the child into its four quads.
+        network_parent_quads = parent['network'].split(".") # Split the network of the parent into its four quads.
+        netmask_parent_quads = parent['netmask'].split(".") # Split the netmask of the parent into its four quads.
+
+        for i in range(len(network_child_quads)): # For each quad in the network of the child...
+            network_child_quads[i] = bin(int(network_child_quads[i])).replace("0b","") # Convert the quad to binary.
+            network_child_quads[i] = network_child_quads[i].zfill(8)
+            network_parent_quads[i] = bin(int(network_parent_quads[i])).replace("0b","") # Convert the quad to binary.
+            network_parent_quads[i] = network_parent_quads[i].zfill(8)
+
+        for i in range(len(netmask_parent_quads)): # For each quad in the netmask of the parent...
+            netmask_parent_quads[i] = bin(int(netmask_parent_quads[i])).replace("0b","")
+            netmask_parent_quads[i] = netmask_parent_quads[i].zfill(8)
+        child_ip = ''.join(network_child_quads) # Join the quads of the network of the child together to form the IP address of the child.
+        parent_ip = ''.join(network_parent_quads) # Join the quads of the network of the parent together to form the IP address of the parent.
+        netmask = ''.join(netmask_parent_quads) # Join the quads of the netmask of the parent together to form the netmask of the parent.
+        if parent_ip == child_ip:
+            return True
+        for i in range(len(netmask)):
+            if netmask[i] == '0' and child_ip[i-1] == parent_ip[i-1]:
+                return True
+            elif child_ip[i] != parent_ip[i]:
+                return False
+        return False
+        
+    def handleDump(self, msg):
+        """
+        This function handles a dump message from a neighbor.
+        
+        Parameters:
+        msg (dict): The dump message.
+        
+        Returns:
+        None
+        """
+        message = {} # Create a new object to store the message.
+        message['src'] = msg['dst']
+        message['dst'] = msg['src']
+        message['type'] = "table"
+        message['msg'] = self.routing_table
+        self.send(message['dst'], json.dumps(message))
+        return
+
 
     def run(self):
+        """
+        This function runs the router.
+        
+        Returns:
+        None
+        """
         while True:
             socks = select.select(self.sockets.values(), [], [], 0.1)[0]
             for conn in socks:
@@ -84,180 +521,15 @@ class Router:
                         srcif = sock
                         break
                 msg = k.decode('utf-8')
+                self.handleMessage(msg)
                 print("Received message '%s' from %s" % (msg, srcif))
-                self.handle_message(json.loads(msg))
-
-    def handle_message(self, message):
-        """
-        This function handles a message based on its type.
-
-        Parameters:
-        message (dict): The message to handle. The message should be a dictionary with a "type" key.
-        """
-        # This function handles a message.
-        msg_type = message["type"]
-        # Get the type of the message.
-        if msg_type == "update":
-            # If the message is an update...
-            self.handle_update(message)
-            # Handle the update.
-        elif msg_type == "handshake":
-            # If the message is a handshake...
-            self.handle_handshake(message)
-            # Handle the handshake.
-        elif msg_type == "dump":
-            # If the message is a dump...
-            self.handle_dump(message)
-            # Handle the dump.
-        elif msg_type == "data":
-            # If the message is data...
-            self.handle_data(message)
-            # Handle the data.
-        else:
-            # If the message type is unknown...
-            print(f"Unhandled message type: {msg_type}")
-            # Print an error message.
-            
-    def ip_to_bin(self, ip):
-        """
-        This function converts an IP address to binary.
-
-        Parameters:
-        ip (str): The IP address to convert.
-
-        Returns:
-        str: The binary representation of the IP address.
-        """
-        return ''.join([bin(int(x) + 256)[3:] for x in ip.split('.')])
-
-    def handle_update(self, message):
-        """
-        This function handles an update message.
-
-        Parameters:
-        message (dict): The update message to handle.
-        """
-        network = message["msg"]["network"]
-        netmask = message["msg"]["netmask"]
-        localpref = message["msg"]["localpref"]
-        as_path = message["msg"]["ASPath"]
-        origin = message["msg"]["origin"]
-        selfOrigin = message["msg"].get("selfOrigin", False)
-        route_key = f"{network}/{netmask}"
-        self.routing_table[route_key] = {
-            "src": message["src"],
-            "dst": message["dst"],
-            "localpref": localpref,
-            "ASPath": as_path,
-            "origin": origin,
-            "selfOrigin": selfOrigin,
-            "received_from": message["src"]
-        }
-        self.propagate_update(message)
-
-
-    def propagate_update(self, msg):
-        """
-        This function propagates an update message to all neighbors except the one from which the original message was received.
-
-        Parameters:
-        msg (dict): The original update message.
-        """
-        for neighbor, info in self.sockets.items():
-            if neighbor != msg["src"]:
-                updated_message = {
-                    "type": "update",
-                    "src": self.our_addr(neighbor),
-                    "dst": neighbor,
-                    "msg": {
-                        "network": msg["msg"]["network"],
-                        "netmask": msg["msg"]["netmask"],
-                        "ASPath": [self.asn] + msg["msg"]["ASPath"],
-                    }
-                }
-                self.send(neighbor, json.dumps(updated_message))
-
-    def handle_handshake(self, src, msg):
-        print("Handshake received from %s" % src)
-
-    def handle_dump(self, message):
-        """
-        This function handles a dump message.
-
-        Parameters:
-        message (dict): The dump message to handle.
-        """
-        table_message = {
-            "src": message["dst"],
-            "dst": message["src"],
-            "type": "table",
-            "msg": []
-        }
-        for route_key, route_info in self.routing_table.items():
-            table_message["msg"].append({
-                "network": route_key.split('/')[0],
-                "netmask": route_key.split('/')[1],
-                "peer": route_info["received_from"],
-                "localpref": route_info["localpref"],
-                "ASPath": route_info["ASPath"],
-                "selfOrigin": route_info["selfOrigin"],
-                "origin": route_info["origin"]
-            })
-        self.send(message["src"], json.dumps(table_message))
-
-    def find_best_route(self, dst_ip):
-        """
-        This function finds the best route for a given destination IP address.
-
-        Parameters:
-        dst_ip (str): The destination IP address.
-
-        Returns:
-        dict: The best route for the destination IP address.
-        """
-        dst_ip_bin = int(self.ip_to_bin(dst_ip), 2)
-
-        for route_key, route_desc in self.routing_table.items():
-            network, netmask = route_key.split('/')
-            network_bin = int(self.ip_to_bin(network), 2)
-            netmask_bin = int(self.ip_to_bin(netmask), 2)
-            if dst_ip_bin & netmask_bin == network_bin & netmask_bin:
-                return route_desc
-
-    def handle_data(self, message):
-        """
-        This function handles a data message.
-
-        Parameters:
-        message (dict): The data message to handle.
-        """
-        dst_ip = message["dst"]
-        best_route = self.find_best_route(dst_ip)
-        if best_route:
-            self.forward_data(best_route["received_from"], message)
-
-
-    def forward_data(self, next_hop, message):
-        """
-        This function forwards a data packet to the next hop towards its destination.
-
-        Parameters:
-        next_hop (str): The next hop for the data packet.
-        message (dict): The data packet to forward.
-        """
-        if next_hop in self.sockets:
-            self.send(next_hop, json.dumps(message))
-            print(f"Forwarded data packet to {next_hop} for destination {message['dst']}")
-        else:
-            print(f"Next hop {next_hop} not found in sockets. Cannot forward packet.")
+        return
 
 
 if __name__ == "__main__":
-    """Runs the router, given in the starter code"""
-    parser = argparse.ArgumentParser(description='Route packets between networks')
+    parser = argparse.ArgumentParser(description='route packets')
     parser.add_argument('asn', type=int, help="AS number of this router")
-    parser.add_argument('connections', nargs='+', help="Connections in the format port-neighbor-relation")
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
     args = parser.parse_args()
-
     router = Router(args.asn, args.connections)
     router.run()
